@@ -1,0 +1,419 @@
+#!/usr/bin/env -S python -u
+
+import ctypes
+import os
+import sys
+
+from evdev import UInput, ecodes
+from PyQt6 import sip
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QFont
+from PyQt6.QtNetwork import QLocalServer
+from PyQt6.QtWidgets import (
+    QApplication,
+    QGridLayout,
+    QPushButton,
+    QSizePolicy,
+    QWidget,
+)
+
+
+SOCKET_PATH = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
+    "moonlight-controller-keyboard.sock",
+)
+LAYER_BRIDGE_PATH = os.path.expanduser(
+    "~/.local/lib/libmoonlight-keyboard-layer.so"
+)
+
+MODIFIERS = {
+    "Shift": ecodes.KEY_LEFTSHIFT,
+    "Ctrl": ecodes.KEY_LEFTCTRL,
+    "Alt": ecodes.KEY_LEFTALT,
+    "Super": ecodes.KEY_LEFTMETA,
+    "AltGr": ecodes.KEY_RIGHTALT,
+}
+
+
+def key(label, code, shifted=None, width=1):
+    return {
+        "label": label,
+        "shifted": shifted or label,
+        "code": code,
+        "width": width,
+    }
+
+
+def modifier(label, width=1):
+    return {"label": label, "modifier": label, "width": width}
+
+
+def spacer(width):
+    return {"spacer": True, "width": width}
+
+
+ROWS = [
+    [
+        key("Esc", ecodes.KEY_ESC), spacer(0.5),
+        *[key(f"F{i}", getattr(ecodes, f"KEY_F{i}")) for i in range(1, 5)],
+        spacer(0.5),
+        *[key(f"F{i}", getattr(ecodes, f"KEY_F{i}")) for i in range(5, 9)],
+        spacer(0.5),
+        *[key(f"F{i}", getattr(ecodes, f"KEY_F{i}")) for i in range(9, 13)],
+        spacer(1.0),
+        key("PrtSc", ecodes.KEY_SYSRQ),
+        key("Scroll", ecodes.KEY_SCROLLLOCK),
+        key("Pause", ecodes.KEY_PAUSE),
+    ],
+    [
+        key("`", ecodes.KEY_GRAVE, "~"),
+        key("1", ecodes.KEY_1, "!"),
+        key("2", ecodes.KEY_2, "@"),
+        key("3", ecodes.KEY_3, "#"),
+        key("4", ecodes.KEY_4, "$"),
+        key("5", ecodes.KEY_5, "%"),
+        key("6", ecodes.KEY_6, "^"),
+        key("7", ecodes.KEY_7, "&"),
+        key("8", ecodes.KEY_8, "*"),
+        key("9", ecodes.KEY_9, "("),
+        key("0", ecodes.KEY_0, ")"),
+        key("-", ecodes.KEY_MINUS, "_"),
+        key("=", ecodes.KEY_EQUAL, "+"),
+        key("Backspace", ecodes.KEY_BACKSPACE, width=2),
+        spacer(0.5),
+        key("Ins", ecodes.KEY_INSERT),
+        key("Home", ecodes.KEY_HOME),
+        key("PgUp", ecodes.KEY_PAGEUP),
+    ],
+    [
+        key("Tab", ecodes.KEY_TAB, width=1.5),
+        *[key(letter, getattr(ecodes, f"KEY_{letter.upper()}"), letter.upper())
+          for letter in "qwertyuiop"],
+        key("[", ecodes.KEY_LEFTBRACE, "{"),
+        key("]", ecodes.KEY_RIGHTBRACE, "}"),
+        key("\\", ecodes.KEY_BACKSLASH, "|", width=1.5),
+        spacer(0.5),
+        key("Del", ecodes.KEY_DELETE),
+        key("End", ecodes.KEY_END),
+        key("PgDn", ecodes.KEY_PAGEDOWN),
+    ],
+    [
+        key("Caps", ecodes.KEY_CAPSLOCK, width=1.75),
+        *[key(letter, getattr(ecodes, f"KEY_{letter.upper()}"), letter.upper())
+          for letter in "asdfghjkl"],
+        key(";", ecodes.KEY_SEMICOLON, ":"),
+        key("'", ecodes.KEY_APOSTROPHE, '"'),
+        key("Enter", ecodes.KEY_ENTER, width=2.25),
+    ],
+    [
+        modifier("Shift", width=2.25),
+        *[key(letter, getattr(ecodes, f"KEY_{letter.upper()}"), letter.upper())
+          for letter in "zxcvbnm"],
+        key(",", ecodes.KEY_COMMA, "<"),
+        key(".", ecodes.KEY_DOT, ">"),
+        key("/", ecodes.KEY_SLASH, "?"),
+        modifier("Shift", width=2.75),
+        spacer(1.5),
+        key("↑", ecodes.KEY_UP),
+    ],
+    [
+        spacer(0.25),
+        modifier("Ctrl", width=1.5),
+        modifier("Super", width=1.5),
+        modifier("Alt", width=1.5),
+        key("Space", ecodes.KEY_SPACE, width=6),
+        modifier("AltGr", width=1.5),
+        key("Menu", ecodes.KEY_MENU),
+        modifier("Ctrl", width=1.5),
+        spacer(0.75),
+        key("←", ecodes.KEY_LEFT),
+        key("↓", ecodes.KEY_DOWN),
+        key("→", ecodes.KEY_RIGHT),
+    ],
+]
+
+
+class ControllerKeyboard(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.active_modifiers = set()
+        self.selected_row = 2
+        self.selected_col = 1
+        self.buttons = []
+        self.visible_state = False
+
+        codes = {
+            item["code"]
+            for row in ROWS
+            for item in row
+            if "code" in item
+        } | set(MODIFIERS.values())
+        self.ui = UInput(
+            {ecodes.EV_KEY: sorted(codes)},
+            name="Moonlight Controller Virtual Keyboard",
+            bustype=ecodes.BUS_VIRTUAL,
+        )
+
+        self.setWindowTitle("Moonlight Controller Keyboard")
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setObjectName("keyboard")
+
+        layout = QGridLayout(self)
+        self.grid = layout
+        max_columns = 0
+        for row_number, row in enumerate(ROWS):
+            row_buttons = []
+            column = 0
+            for column_number, item in enumerate(row):
+                span = max(1, round(item.get("width", 1) * 4))
+                if item.get("spacer"):
+                    column += span
+                    row_buttons.append(None)
+                    continue
+                button = QPushButton(item["label"])
+                button.setMinimumHeight(0)
+                button.setSizePolicy(
+                    QSizePolicy.Policy.Expanding,
+                    QSizePolicy.Policy.Expanding,
+                )
+                button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                button.clicked.connect(
+                    lambda checked=False, r=row_number, c=column_number:
+                    self.activate_at(r, c)
+                )
+                layout.addWidget(button, row_number, column, 1, span)
+                column += span
+                row_buttons.append(button)
+            self.buttons.append(row_buttons)
+            max_columns = max(max_columns, column)
+
+        # Quarter-key columns must all carry equal layout weight. Without this,
+        # columns containing only a spacer collapse and the keyboard clusters
+        # lose their intended visual separation.
+        for column in range(max_columns):
+            layout.setColumnStretch(column, 1)
+
+        self.configure_for_screen()
+        self.configure_layer_surface()
+        QApplication.primaryScreen().geometryChanged.connect(
+            lambda geometry: self.screen_geometry_changed()
+        )
+        self.refresh()
+        self.hide()
+
+        QLocalServer.removeServer(SOCKET_PATH)
+        self.server = QLocalServer(self)
+        if not self.server.listen(SOCKET_PATH):
+            raise RuntimeError(self.server.errorString())
+        self.server.newConnection.connect(self.accept_connections)
+        print(f"Controller keyboard listening on {SOCKET_PATH}")
+
+    def closeEvent(self, event):
+        self.release_all_modifiers()
+        self.ui.close()
+        QLocalServer.removeServer(SOCKET_PATH)
+        super().closeEvent(event)
+
+    def accept_connections(self):
+        while self.server.hasPendingConnections():
+            connection = self.server.nextPendingConnection()
+            connection.readyRead.connect(
+                lambda conn=connection: self.read_command(conn)
+            )
+
+    def read_command(self, connection):
+        command = bytes(connection.readAll()).decode().strip()
+        result = self.command(command)
+        connection.write((result + "\n").encode())
+        connection.flush()
+        connection.disconnectFromServer()
+
+    def command(self, command):
+        if command == "status":
+            return "visible" if self.visible_state else "hidden"
+        if command == "toggle":
+            self.hide_keyboard() if self.visible_state else self.show_keyboard()
+        elif command == "show":
+            self.show_keyboard()
+        elif command in ("hide", "cancel"):
+            self.hide_keyboard()
+        elif self.visible_state and command in ("left", "right", "up", "down"):
+            self.move(command)
+        elif self.visible_state and command == "activate":
+            self.activate_at(self.selected_row, self.selected_col)
+        elif self.visible_state and command == "backspace":
+            self.emit_key(ecodes.KEY_BACKSPACE)
+        elif self.visible_state and command == "toggle_shift":
+            self.toggle_modifier("Shift")
+        return "visible" if self.visible_state else "hidden"
+
+    def show_keyboard(self):
+        self.visible_state = True
+        self.show()
+        self.raise_()
+        self.refresh()
+
+    def hide_keyboard(self):
+        self.visible_state = False
+        self.release_all_modifiers()
+        self.hide()
+
+    def configure_layer_surface(self):
+        screen = QApplication.primaryScreen().geometry()
+        height = screen.height() // 3
+        self.winId()
+        window_pointer = sip.unwrapinstance(self.windowHandle())
+        bridge = ctypes.CDLL(LAYER_BRIDGE_PATH)
+        bridge.configure_keyboard_layer.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        bridge.configure_keyboard_layer.restype = ctypes.c_bool
+        if not bridge.configure_keyboard_layer(window_pointer, height):
+            raise RuntimeError("Could not configure the layer-shell surface")
+        self.layer_bridge = bridge
+
+    def screen_geometry_changed(self):
+        self.configure_for_screen()
+        self.configure_layer_surface()
+
+    def configure_for_screen(self):
+        primary_screen = QApplication.primaryScreen()
+        screen = primary_screen.geometry()
+        target_height = max(1, screen.height() // 3)
+        margin = max(2, min(12, target_height // 35))
+        spacing = max(1, min(5, target_height // 80))
+        padding = max(1, min(4, target_height // 100))
+        row_height = (
+            target_height - (2 * margin) - (spacing * (len(ROWS) - 1))
+        ) / len(ROWS)
+        device_scale = primary_screen.devicePixelRatio()
+        font_pixels = max(
+            12,
+            min(32, round(row_height * 0.2088 * device_scale)),
+        )
+
+        self.grid.setContentsMargins(margin, margin, margin, margin)
+        self.grid.setSpacing(spacing)
+        font = QFont("Sans Serif")
+        font.setPixelSize(font_pixels)
+        self.setFont(font)
+        for row_buttons in self.buttons:
+            for button in row_buttons:
+                if button is not None:
+                    button.setFont(font)
+        self.key_padding = padding
+        self.refresh()
+
+    def item_center(self, row, column):
+        widths = [item.get("width", 1) for item in ROWS[row]]
+        return sum(widths[:column]) + widths[column] / 2
+
+    def valid_columns(self, row):
+        return [
+            column for column, item in enumerate(ROWS[row])
+            if not item.get("spacer")
+        ]
+
+    def move(self, direction):
+        if direction == "left":
+            columns = self.valid_columns(self.selected_row)
+            position = columns.index(self.selected_col)
+            self.selected_col = columns[(position - 1) % len(columns)]
+        elif direction == "right":
+            columns = self.valid_columns(self.selected_row)
+            position = columns.index(self.selected_col)
+            self.selected_col = columns[(position + 1) % len(columns)]
+        else:
+            old_center = self.item_center(self.selected_row, self.selected_col)
+            delta = -1 if direction == "up" else 1
+            self.selected_row = (self.selected_row + delta) % len(ROWS)
+            self.selected_col = min(
+                self.valid_columns(self.selected_row),
+                key=lambda col: abs(self.item_center(self.selected_row, col) - old_center),
+            )
+        self.refresh()
+
+    def activate_at(self, row, column):
+        self.selected_row = row
+        self.selected_col = column
+        item = ROWS[row][column]
+        if item.get("spacer"):
+            return
+        if "modifier" in item:
+            self.toggle_modifier(item["modifier"])
+        else:
+            self.emit_key(item["code"])
+        self.refresh()
+
+    def toggle_modifier(self, name):
+        if name in self.active_modifiers:
+            self.active_modifiers.remove(name)
+        else:
+            self.active_modifiers.add(name)
+        self.refresh()
+
+    def emit_key(self, code):
+        for name in MODIFIERS:
+            if name in self.active_modifiers:
+                self.ui.write(ecodes.EV_KEY, MODIFIERS[name], 1)
+        self.ui.write(ecodes.EV_KEY, code, 1)
+        self.ui.syn()
+        self.ui.write(ecodes.EV_KEY, code, 0)
+        for name in reversed(MODIFIERS):
+            if name in self.active_modifiers:
+                self.ui.write(ecodes.EV_KEY, MODIFIERS[name], 0)
+        self.ui.syn()
+
+    def release_all_modifiers(self):
+        self.active_modifiers.clear()
+        self.refresh()
+
+    def refresh(self):
+        shifted = "Shift" in self.active_modifiers
+        for row_number, row in enumerate(ROWS):
+            for column_number, item in enumerate(row):
+                button = self.buttons[row_number][column_number]
+                if button is None:
+                    continue
+                label = (
+                    item.get("shifted", item["label"])
+                    if shifted else item["label"]
+                )
+                # QPushButton treats ampersands as mnemonic markers. Doubling
+                # them renders a literal ampersand on the key cap.
+                button.setText(label.replace("&", "&&"))
+                selected = (
+                    row_number == self.selected_row
+                    and column_number == self.selected_col
+                )
+                active = item.get("modifier") in self.active_modifiers
+                if selected and active:
+                    colors = "background:#f59e0b;color:#111827;border:4px solid #fff;"
+                elif selected:
+                    colors = "background:#2563eb;color:white;border:4px solid #93c5fd;"
+                elif active:
+                    colors = "background:#f59e0b;color:#111827;border:2px solid #fde68a;"
+                else:
+                    colors = "background:#30343b;color:white;border:1px solid #59616d;"
+                padding = getattr(self, "key_padding", 2)
+                button.setStyleSheet(
+                    "QPushButton{" + colors
+                    + f"border-radius:6px;padding:{padding}px;" + "}"
+                )
+        self.setStyleSheet("#keyboard{background:#17191d;}")
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    keyboard = ControllerKeyboard()
+    app.aboutToQuit.connect(keyboard.release_all_modifiers)
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

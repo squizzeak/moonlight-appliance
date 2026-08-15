@@ -1,0 +1,13 @@
+[Unit]
+Description=Moonlight controller on-screen keyboard
+After=graphical-session.target
+
+[Service]
+Type=simple
+Environment=QT_WAYLAND_SHELL_INTEGRATION=layer-shell
+ExecStart=%h/.local/bin/moonlight-controller-keyboard
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

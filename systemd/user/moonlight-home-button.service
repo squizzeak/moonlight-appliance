@@ -1,0 +1,14 @@
+[Unit]
+Description=Moonlight controller Home button listener
+After=graphical-session.target
+Wants=moonlight-controller-keyboard.service
+After=moonlight-controller-keyboard.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/moonlight-home-button
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,898 @@
+#!/usr/bin/env -S python -u
+
+import asyncio
+import math
+import os
+import socket
+import subprocess
+import time
+
+from evdev import InputDevice, UInput, ecodes, list_devices
+
+
+BTN_MODE = ecodes.BTN_MODE
+BTN_SOUTH = ecodes.BTN_SOUTH
+BTN_EAST = ecodes.BTN_EAST
+# Linux's gamepad aliases map Xbox X to BTN_NORTH (BTN_X). BTN_WEST is
+# the Xbox Y button, despite what the directional names might suggest.
+BTN_X = ecodes.BTN_NORTH
+BTN_Y = ecodes.BTN_WEST
+BTN_SELECT = ecodes.BTN_SELECT
+BTN_THUMBL = ecodes.BTN_THUMBL
+BTN_TL = ecodes.BTN_TL
+BTN_TR = ecodes.BTN_TR
+
+ABS_X = ecodes.ABS_X
+ABS_Y = ecodes.ABS_Y
+ABS_RX = ecodes.ABS_RX
+ABS_RY = ecodes.ABS_RY
+ABS_Z = ecodes.ABS_Z
+ABS_RZ = ecodes.ABS_RZ
+ABS_HAT0X = ecodes.ABS_HAT0X
+ABS_HAT0Y = ecodes.ABS_HAT0Y
+LOGICAL_STICK_AXES = (ABS_X, ABS_Y, ABS_RX, ABS_RY)
+
+MOONLIGHT_CLASS = "com.moonlight_stream.Moonlight"
+KEYBOARD_SOCKET = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
+    "moonlight-controller-keyboard.sock",
+)
+
+RESCAN_SECONDS = 2
+MOONLIGHT_STATE_CACHE_SECONDS = 0.25
+HOME_LONG_PRESS_SECONDS = 2.0
+B_CLOSE_HOLD_SECONDS = 1.0
+Y_SWITCHER_HOLD_SECONDS = 0.35
+D_PAD_REPEAT_DELAY_SECONDS = 0.35
+D_PAD_REPEAT_INTERVAL_SECONDS = 0.10
+DISCONNECT_BLUETOOTH_ON_SLEEP = True
+
+MOVE_DEADZONE = 0.15
+SCROLL_DEADZONE = 0.30
+MAX_CURSOR_SPEED = 1800.0
+CURSOR_EXPONENT = 1.8
+MOUSE_HZ = 120.0
+MAX_SCROLL_STEPS_PER_SEC = 18.0
+
+
+_cached_moonlight_state = None
+_cached_moonlight_state_time = 0.0
+_keyboard_visible = False
+
+
+def run(cmd):
+    return subprocess.run(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def find_moonlight_windows():
+    result = run(["kdotool", "search", "--class", MOONLIGHT_CLASS])
+    if result.returncode != 0:
+        return []
+
+    windows = []
+    for window_id in (
+        line.strip() for line in result.stdout.splitlines() if line.strip()
+    ):
+        result = run(["kdotool", "getwindowname", window_id])
+        if result.returncode == 0:
+            windows.append((window_id, result.stdout.strip()))
+    return windows
+
+
+def query_moonlight_state():
+    windows = find_moonlight_windows()
+    if not windows:
+        return "absent"
+    if any(caption.endswith(" - Moonlight") for _, caption in windows):
+        return "streaming"
+    if any(caption == "Moonlight" for _, caption in windows):
+        return "launcher"
+    return "unknown"
+
+
+def moonlight_state(force=False):
+    global _cached_moonlight_state
+    global _cached_moonlight_state_time
+
+    now = time.monotonic()
+    if (
+        force
+        or _cached_moonlight_state is None
+        or now - _cached_moonlight_state_time
+        >= MOONLIGHT_STATE_CACHE_SECONDS
+    ):
+        _cached_moonlight_state = query_moonlight_state()
+        _cached_moonlight_state_time = now
+    return _cached_moonlight_state
+
+
+def invalidate_moonlight_state_cache():
+    global _cached_moonlight_state
+    global _cached_moonlight_state_time
+    _cached_moonlight_state = None
+    _cached_moonlight_state_time = 0.0
+
+
+def keyboard_command(command):
+    global _keyboard_visible
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(0.25)
+            client.connect(KEYBOARD_SOCKET)
+            client.sendall((command + "\n").encode())
+            response = client.recv(64).decode().strip()
+    except (OSError, UnicodeError):
+        _keyboard_visible = False
+        return "unavailable"
+
+    _keyboard_visible = response == "visible"
+    return response
+
+
+def keyboard_is_visible():
+    return keyboard_command("status") == "visible"
+
+
+def overview_is_active():
+    result = run([
+        "busctl",
+        "--user",
+        "get-property",
+        "org.kde.KWin",
+        "/Effects",
+        "org.kde.kwin.Effects",
+        "activeEffects",
+    ])
+    return result.returncode == 0 and '"overview"' in result.stdout.split()
+
+
+def exit_overview():
+    result = run([
+        "qdbus6",
+        "org.kde.kglobalaccel",
+        "/component/kwin",
+        "invokeShortcut",
+        "Overview",
+    ])
+    if result.returncode != 0:
+        print("Could not exit KWin Overview")
+
+
+async def focus_launched_moonlight():
+    # Window creation is asynchronous. Activating the window after KWin has
+    # registered it also provides a second safeguard against Overview staying
+    # in front of the newly launched application.
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        windows = find_moonlight_windows()
+        if windows:
+            window_id, caption = next(
+                (
+                    (window_id, caption)
+                    for window_id, caption in windows
+                    if caption == "Moonlight"
+                ),
+                windows[0],
+            )
+            print(f"Moonlight launched: activating {caption!r}")
+            run(["kdotool", "windowactivate", window_id])
+            invalidate_moonlight_state_cache()
+            return
+        await asyncio.sleep(0.1)
+    print("Moonlight launch timed out before its window appeared")
+
+
+async def repeat_keyboard_navigation(command):
+    await asyncio.sleep(D_PAD_REPEAT_DELAY_SECONDS)
+    while _keyboard_visible and moonlight_state() == "absent":
+        if keyboard_command(command) != "visible":
+            return
+        await asyncio.sleep(D_PAD_REPEAT_INTERVAL_SECONDS)
+
+
+def handle_home_button():
+    windows = find_moonlight_windows()
+    if not windows:
+        print("Home pressed: launching Moonlight")
+        keyboard_command("hide")
+        if overview_is_active():
+            print("KWin Overview is active: exiting before launch")
+            exit_overview()
+        subprocess.Popen(
+            ["moonlight"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        invalidate_moonlight_state_cache()
+        asyncio.create_task(focus_launched_moonlight())
+        return
+
+    for _, caption in windows:
+        if caption.endswith(" - Moonlight"):
+            print(f"Home pressed while streaming ({caption!r}): ignoring")
+            return
+
+    for window_id, caption in windows:
+        if caption == "Moonlight":
+            print("Home pressed: activating Moonlight")
+            run(["kdotool", "windowactivate", window_id])
+            invalidate_moonlight_state_cache()
+            return
+
+    print(
+        "Home pressed: Moonlight window found with unknown caption; "
+        "taking no action"
+    )
+
+
+def close_focused_window(reason="B held"):
+    result = run(["kdotool", "getactivewindow"])
+    window_id = result.stdout.strip() if result.returncode == 0 else ""
+    if not window_id:
+        print(f"{reason}: no focused window to close")
+        return
+
+    name_result = run(["kdotool", "getwindowname", window_id])
+    name = name_result.stdout.strip() if name_result.returncode == 0 else window_id
+    print(f"{reason}: closing focused window {name!r}")
+    close_result = run(["kdotool", "windowclose", window_id])
+    if close_result.returncode != 0:
+        print(f"Could not close focused window {window_id}")
+
+
+def create_virtual_mouse():
+    capabilities = {
+        ecodes.EV_KEY: [
+            ecodes.BTN_LEFT,
+            ecodes.BTN_RIGHT,
+            ecodes.KEY_LEFTALT,
+            ecodes.KEY_TAB,
+            ecodes.KEY_LEFT,
+            ecodes.KEY_RIGHT,
+            ecodes.KEY_UP,
+            ecodes.KEY_DOWN,
+        ],
+        ecodes.EV_REL: [
+            ecodes.REL_X,
+            ecodes.REL_Y,
+            ecodes.REL_WHEEL,
+            ecodes.REL_HWHEEL,
+        ],
+    }
+    return UInput(
+        capabilities,
+        name="Moonlight Controller Virtual Mouse",
+        bustype=ecodes.BUS_VIRTUAL,
+    )
+
+
+def normalize_axis(value, info):
+    """Normalize an evdev absolute axis to [-1, 1]."""
+    if info is None:
+        return 0.0
+
+    minimum = float(info.min)
+    maximum = float(info.max)
+    half_range = (maximum - minimum) / 2.0
+    if half_range <= 0.0 or not math.isfinite(half_range):
+        return 0.0
+
+    center = (minimum + maximum) / 2.0
+    normalized = (float(value) - center) / half_range
+    if not math.isfinite(normalized):
+        return 0.0
+    return max(-1.0, min(1.0, normalized))
+
+
+def normalized_flat(info):
+    """Return the kernel-declared flat region in normalized units."""
+    if info is None:
+        return 0.0
+    half_range = (float(info.max) - float(info.min)) / 2.0
+    if half_range <= 0.0:
+        return 0.0
+    return max(0.0, min(1.0, float(info.flat) / half_range))
+
+
+def apply_deadzone(value, deadzone):
+    deadzone = max(0.0, min(0.99, deadzone))
+    magnitude = abs(value)
+    if magnitude <= deadzone:
+        return 0.0
+    scaled = (magnitude - deadzone) / (1.0 - deadzone)
+    return math.copysign(scaled, value)
+
+
+def cursor_curve(value):
+    if value == 0:
+        return 0.0
+    return math.copysign(abs(value) ** CURSOR_EXPONENT, value)
+
+
+def axis_name(code):
+    return ecodes.ABS.get(code, f"ABS_{code}")
+
+
+class ControllerState:
+    def __init__(self, dev):
+        self.path = dev.path
+        self.bluetooth_address = (
+            (dev.uniq or "").upper()
+            if dev.info.bustype == ecodes.BUS_BLUETOOTH
+            else None
+        )
+        self.axis_info = {}
+        self.axis_values = {}
+        self.physical_to_logical = {}
+
+        supported_axes = {
+            item[0] if isinstance(item, tuple) else item
+            for item in dev.capabilities().get(ecodes.EV_ABS, [])
+        }
+        right_x = ABS_RX if ABS_RX in supported_axes else ABS_Z
+        right_y = ABS_RY if ABS_RY in supported_axes else ABS_RZ
+        axis_mapping = {
+            ABS_X: ABS_X,
+            ABS_Y: ABS_Y,
+            ABS_RX: right_x,
+            ABS_RY: right_y,
+        }
+
+        print(f"Watching {dev.path}: {dev.name}")
+        for logical_code in LOGICAL_STICK_AXES:
+            physical_code = axis_mapping[logical_code]
+            try:
+                if physical_code not in supported_axes:
+                    raise KeyError(physical_code)
+                info = dev.absinfo(physical_code)
+            except (KeyError, OSError, ValueError):
+                info = None
+
+            self.axis_info[logical_code] = info
+            if info is None:
+                self.axis_values[logical_code] = 0.0
+                print(f"  {axis_name(logical_code)}: unavailable")
+                continue
+
+            self.physical_to_logical[physical_code] = logical_code
+            self.axis_values[logical_code] = normalize_axis(info.value, info)
+            source = ""
+            if physical_code != logical_code:
+                source = f" (via {axis_name(physical_code)})"
+            print(
+                f"  {axis_name(logical_code)}{source}: "
+                f"value={info.value} min={info.min} "
+                f"max={info.max} flat={info.flat}"
+            )
+
+    def update_axis(self, code, value):
+        logical_code = self.physical_to_logical.get(code)
+        if logical_code is not None:
+            self.axis_values[logical_code] = normalize_axis(
+                value, self.axis_info[logical_code]
+            )
+
+    def axis(self, code, configured_deadzone):
+        deadzone = max(
+            configured_deadzone,
+            normalized_flat(self.axis_info.get(code)),
+        )
+        return apply_deadzone(self.axis_values.get(code, 0.0), deadzone)
+
+
+def strongest_axis(states, code, configured_deadzone):
+    values = [state.axis(code, configured_deadzone) for state in states.values()]
+    return max(values, key=abs, default=0.0)
+
+
+class VirtualButtons:
+    """Track button ownership so multiple controllers cannot stick a click."""
+
+    def __init__(self, ui):
+        self.ui = ui
+        self.sources = {
+            ecodes.BTN_LEFT: set(),
+            ecodes.BTN_RIGHT: set(),
+            ecodes.KEY_LEFT: set(),
+            ecodes.KEY_RIGHT: set(),
+            ecodes.KEY_UP: set(),
+            ecodes.KEY_DOWN: set(),
+            ecodes.KEY_LEFTALT: set(),
+            ecodes.KEY_TAB: set(),
+        }
+
+    def event(self, source, button, value, enabled):
+        owners = self.sources[button]
+        was_down = bool(owners)
+
+        if value == 0:
+            owners.discard(source)
+        elif value == 1 and enabled:
+            owners.add(source)
+        else:
+            return
+
+        is_down = bool(owners)
+        if is_down != was_down:
+            self.ui.write(ecodes.EV_KEY, button, int(is_down))
+            self.ui.syn()
+
+    def release_source(self, source):
+        for button, owners in self.sources.items():
+            matching = {
+                owner
+                for owner in owners
+                if owner == source
+                or (isinstance(owner, tuple) and owner[0] == source)
+            }
+            if matching:
+                owners.difference_update(matching)
+                if not owners:
+                    self.ui.write(ecodes.EV_KEY, button, 0)
+                    self.ui.syn()
+
+    def release_all(self):
+        emitted = False
+        for button, owners in self.sources.items():
+            if owners:
+                owners.clear()
+                self.ui.write(ecodes.EV_KEY, button, 0)
+                emitted = True
+        if emitted:
+            self.ui.syn()
+
+
+async def mouse_loop(states, ui, buttons):
+    interval = 1.0 / MOUSE_HZ
+    x_remainder = y_remainder = 0.0
+    vscroll_accumulator = hscroll_accumulator = 0.0
+    last_time = time.monotonic()
+    last_moonlight_state = None
+
+    while True:
+        now = time.monotonic()
+        dt = now - last_time
+        last_time = now
+
+        current_moonlight_state = moonlight_state()
+        if (
+            current_moonlight_state != "absent"
+            and current_moonlight_state != last_moonlight_state
+        ):
+            keyboard_command("hide")
+        last_moonlight_state = current_moonlight_state
+
+        if current_moonlight_state != "absent":
+            x_remainder = y_remainder = 0.0
+            vscroll_accumulator = hscroll_accumulator = 0.0
+            buttons.release_all()
+            await asyncio.sleep(interval)
+            continue
+
+        lx = cursor_curve(strongest_axis(states, ABS_X, MOVE_DEADZONE))
+        ly = cursor_curve(strongest_axis(states, ABS_Y, MOVE_DEADZONE))
+        x_remainder += lx * MAX_CURSOR_SPEED * dt
+        y_remainder += ly * MAX_CURSOR_SPEED * dt
+        emit_x = int(x_remainder)
+        emit_y = int(y_remainder)
+        emitted = False
+
+        if emit_x:
+            ui.write(ecodes.EV_REL, ecodes.REL_X, emit_x)
+            x_remainder -= emit_x
+            emitted = True
+        if emit_y:
+            ui.write(ecodes.EV_REL, ecodes.REL_Y, emit_y)
+            y_remainder -= emit_y
+            emitted = True
+
+        rx = strongest_axis(states, ABS_RX, SCROLL_DEADZONE)
+        ry = strongest_axis(states, ABS_RY, SCROLL_DEADZONE)
+        hscroll_accumulator += rx * MAX_SCROLL_STEPS_PER_SEC * dt
+        vscroll_accumulator += -ry * MAX_SCROLL_STEPS_PER_SEC * dt
+        emit_h = int(hscroll_accumulator)
+        emit_v = int(vscroll_accumulator)
+
+        if emit_h:
+            ui.write(ecodes.EV_REL, ecodes.REL_HWHEEL, emit_h)
+            hscroll_accumulator -= emit_h
+            emitted = True
+        if emit_v:
+            ui.write(ecodes.EV_REL, ecodes.REL_WHEEL, emit_v)
+            vscroll_accumulator -= emit_v
+            emitted = True
+        if emitted:
+            ui.syn()
+        await asyncio.sleep(interval)
+
+
+async def watch_device(dev, states, ui, buttons):
+    source = dev.path
+    state = ControllerState(dev)
+    states[source] = state
+    home_pressed_at = None
+    b_pressed = False
+    b_long_triggered = False
+    b_hold_task = None
+    y_pressed = False
+    y_switcher_active = False
+    y_hold_task = None
+    y_close_task = None
+    dpad_repeat_tasks = {}
+
+    async def trigger_b_hold():
+        nonlocal b_long_triggered
+        await asyncio.sleep(B_CLOSE_HOLD_SECONDS)
+        if b_pressed and moonlight_state(force=True) == "absent":
+            b_long_triggered = True
+            close_focused_window()
+
+    async def trigger_y_hold():
+        nonlocal y_switcher_active
+        await asyncio.sleep(Y_SWITCHER_HOLD_SECONDS)
+        if y_pressed and moonlight_state(force=True) == "absent":
+            keyboard_command("hide")
+            y_switcher_active = True
+            owner = (source, BTN_Y)
+            print("Y held: opening application switcher")
+            buttons.event(owner, ecodes.KEY_LEFTALT, 1, True)
+            buttons.event(owner, ecodes.KEY_TAB, 1, True)
+            buttons.event(owner, ecodes.KEY_TAB, 0, True)
+
+    async def close_switcher_selection():
+        nonlocal y_switcher_active
+        owner = (source, BTN_Y)
+        # KWin does not publish the highlighted TabBox window through its
+        # public D-Bus API. Commit that selection first, close the now-focused
+        # window, and reopen the switcher if Y is still being held.
+        print("D-pad Down: selecting highlighted application for close")
+        buttons.event(owner, ecodes.KEY_LEFTALT, 0, True)
+        y_switcher_active = False
+        await asyncio.sleep(0.15)
+        if moonlight_state(force=True) != "absent":
+            return
+        close_focused_window("Switcher selection")
+        await asyncio.sleep(0.25)
+        if y_pressed and moonlight_state(force=True) == "absent":
+            print("Reopening application switcher after close")
+            buttons.event(owner, ecodes.KEY_LEFTALT, 1, True)
+            buttons.event(owner, ecodes.KEY_TAB, 1, True)
+            buttons.event(owner, ecodes.KEY_TAB, 0, True)
+            y_switcher_active = True
+
+    try:
+        async for event in dev.async_read_loop():
+            if event.type == ecodes.EV_ABS:
+                if event.code in (ABS_HAT0X, ABS_HAT0Y):
+                    repeat_task = dpad_repeat_tasks.pop(event.code, None)
+                    if repeat_task is not None:
+                        repeat_task.cancel()
+
+                    if moonlight_state() != "absent":
+                        buttons.release_all()
+                        continue
+
+                    if (
+                        event.code == ABS_HAT0Y
+                        and event.value > 0
+                        and y_switcher_active
+                    ):
+                        if y_close_task is None or y_close_task.done():
+                            y_close_task = asyncio.create_task(
+                                close_switcher_selection()
+                            )
+                        continue
+
+                    visible = keyboard_is_visible()
+                    if event.code == ABS_HAT0X:
+                        negative_key = ecodes.KEY_LEFT
+                        positive_key = ecodes.KEY_RIGHT
+                        negative_command = "left"
+                        positive_command = "right"
+                    else:
+                        negative_key = ecodes.KEY_UP
+                        positive_key = ecodes.KEY_DOWN
+                        negative_command = "up"
+                        positive_command = "down"
+
+                    buttons.event(source, negative_key, 0, True)
+                    buttons.event(source, positive_key, 0, True)
+                    if event.value and visible:
+                        command = (
+                            negative_command if event.value < 0
+                            else positive_command
+                        )
+                        keyboard_command(command)
+                        dpad_repeat_tasks[event.code] = asyncio.create_task(
+                            repeat_keyboard_navigation(command)
+                        )
+                    elif event.value:
+                        buttons.event(
+                            source,
+                            negative_key if event.value < 0 else positive_key,
+                            1,
+                            True,
+                        )
+                    continue
+
+                state.update_axis(event.code, event.value)
+                continue
+            if event.type != ecodes.EV_KEY:
+                continue
+
+            if event.code == BTN_MODE:
+                if event.value == 1:
+                    # Arm on press, but never perform the action until a
+                    # matching release arrives from this same controller.
+                    home_pressed_at = time.monotonic()
+                elif event.value == 0 and home_pressed_at is not None:
+                    held_seconds = time.monotonic() - home_pressed_at
+                    home_pressed_at = None
+                    if held_seconds < HOME_LONG_PRESS_SECONDS:
+                        handle_home_button()
+                    else:
+                        print(
+                            "Home released after long hold "
+                            f"({held_seconds:.1f}s): ignoring"
+                        )
+                continue
+
+            # Always honor Y release, even if Moonlight appeared while the
+            # switcher was open, so its virtual Alt state and hold task cannot
+            # remain armed.
+            if event.code == BTN_Y and event.value == 0:
+                y_pressed = False
+                if y_hold_task is not None:
+                    y_hold_task.cancel()
+                    y_hold_task = None
+                if y_switcher_active:
+                    print("Y released: selecting highlighted application")
+                    buttons.event(
+                        (source, BTN_Y), ecodes.KEY_LEFTALT, 0, True
+                    )
+                    y_switcher_active = False
+                continue
+
+            state_name = moonlight_state()
+            if state_name != "absent":
+                buttons.release_all()
+                continue
+
+            if event.code == BTN_SELECT and event.value == 1:
+                buttons.release_all()
+                keyboard_command("toggle")
+                continue
+
+            visible = keyboard_is_visible()
+
+            if event.code == BTN_SOUTH:
+                if visible:
+                    buttons.event(source, ecodes.BTN_LEFT, 0, True)
+                    if event.value == 1:
+                        keyboard_command("activate")
+                else:
+                    buttons.event(source, ecodes.BTN_LEFT, event.value, True)
+            elif event.code == BTN_EAST:
+                if event.value == 1:
+                    b_pressed = True
+                    b_long_triggered = False
+                    if b_hold_task is not None:
+                        b_hold_task.cancel()
+                    b_hold_task = asyncio.create_task(trigger_b_hold())
+                elif event.value == 0 and b_pressed:
+                    b_pressed = False
+                    if b_hold_task is not None:
+                        b_hold_task.cancel()
+                        b_hold_task = None
+                    if not b_long_triggered:
+                        if visible:
+                            keyboard_command("hide")
+                        else:
+                            # Delay the right click until release so a long
+                            # hold can be distinguished without first opening
+                            # an application's context menu.
+                            buttons.event(
+                                source, ecodes.BTN_RIGHT, 1, True
+                            )
+                            buttons.event(
+                                source, ecodes.BTN_RIGHT, 0, True
+                            )
+            elif event.code == BTN_TR:
+                # Keep a distinct owner from A so releasing either physical
+                # control cannot release a click while the other is held.
+                buttons.event(
+                    (source, BTN_TR), ecodes.BTN_LEFT, event.value, True
+                )
+            elif event.code == BTN_TL:
+                # Likewise, keep this independent from B's right-click state.
+                buttons.event(
+                    (source, BTN_TL), ecodes.BTN_RIGHT, event.value, True
+                )
+            elif event.code == BTN_Y:
+                if event.value == 1:
+                    y_pressed = True
+                    y_switcher_active = False
+                    if y_hold_task is not None:
+                        y_hold_task.cancel()
+                    y_hold_task = asyncio.create_task(trigger_y_hold())
+            elif event.code == BTN_X and visible and event.value == 1:
+                keyboard_command("backspace")
+            elif event.code == BTN_THUMBL and visible and event.value == 1:
+                keyboard_command("toggle_shift")
+    except OSError:
+        print(f"Device disconnected: {dev.path}")
+    finally:
+        # A disconnect while Home is held is not a button release. Discard the
+        # armed press so powering off a controller cannot launch Moonlight.
+        home_pressed_at = None
+        b_pressed = False
+        if b_hold_task is not None:
+            b_hold_task.cancel()
+            await asyncio.gather(b_hold_task, return_exceptions=True)
+            b_hold_task = None
+        y_pressed = False
+        if y_hold_task is not None:
+            y_hold_task.cancel()
+            await asyncio.gather(y_hold_task, return_exceptions=True)
+            y_hold_task = None
+        if y_close_task is not None:
+            y_close_task.cancel()
+            await asyncio.gather(y_close_task, return_exceptions=True)
+            y_close_task = None
+        repeat_tasks = list(dpad_repeat_tasks.values())
+        for repeat_task in repeat_tasks:
+            repeat_task.cancel()
+        if repeat_tasks:
+            await asyncio.gather(*repeat_tasks, return_exceptions=True)
+        dpad_repeat_tasks.clear()
+        states.pop(source, None)
+        buttons.release_source(source)
+        if not states:
+            keyboard_command("hide")
+        try:
+            dev.close()
+        except OSError:
+            pass
+
+
+def open_controller(path):
+    try:
+        dev = InputDevice(path)
+        keys = dev.capabilities().get(ecodes.EV_KEY, [])
+        if BTN_MODE in keys:
+            return dev
+        dev.close()
+    except (PermissionError, OSError):
+        pass
+    return None
+
+
+async def controller_manager(states, ui, buttons):
+    tasks = {}
+    while True:
+        for path, task in list(tasks.items()):
+            if task.done():
+                tasks.pop(path)
+                try:
+                    task.result()
+                except Exception as error:
+                    print(f"Controller watcher failed for {path}: {error!r}")
+
+        try:
+            paths = list_devices()
+        except OSError:
+            paths = []
+
+        for path in paths:
+            if path in tasks:
+                continue
+            dev = open_controller(path)
+            if dev is not None:
+                tasks[path] = asyncio.create_task(
+                    watch_device(dev, states, ui, buttons)
+                )
+
+        # Keep enforcing the safe startup/disconnected state. The keyboard
+        # service may still be initializing when this manager first starts,
+        # so a single best-effort hide would not be sufficient.
+        if not tasks:
+            keyboard_command("hide")
+
+        await asyncio.sleep(RESCAN_SECONDS)
+
+
+async def disconnect_bluetooth_controllers(states):
+    controllers = {
+        state.bluetooth_address: state
+        for state in states.values()
+        if state.bluetooth_address
+    }
+    if not controllers:
+        print("Preparing for sleep: no Bluetooth controllers connected")
+        return
+
+    for address, state in controllers.items():
+        print(
+            f"Preparing for sleep: disconnecting {state.path} "
+            f"({address})"
+        )
+        process = await asyncio.create_subprocess_exec(
+            "bluetoothctl",
+            "disconnect",
+            address,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            output, _ = await asyncio.wait_for(
+                process.communicate(), timeout=8
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            print(f"Bluetooth disconnect timed out: {address}")
+            continue
+
+        detail = output.decode(errors="replace").strip()
+        if detail:
+            print(detail)
+        if process.returncode != 0:
+            print(
+                f"Bluetooth disconnect failed for {address}: "
+                f"exit {process.returncode}"
+            )
+
+
+async def sleep_monitor(states):
+    match_rule = (
+        "type='signal',sender='org.freedesktop.login1',"
+        "interface='org.freedesktop.login1.Manager',"
+        "member='PrepareForSleep'"
+    )
+    while True:
+        process = await asyncio.create_subprocess_exec(
+            "dbus-monitor",
+            "--system",
+            match_rule,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
+                if line.strip() == b"boolean true":
+                    keyboard_command("hide")
+                    if DISCONNECT_BLUETOOTH_ON_SLEEP:
+                        await disconnect_bluetooth_controllers(states)
+        finally:
+            if process.returncode is None:
+                process.terminate()
+                await process.wait()
+
+        print("Sleep monitor exited; restarting in 2 seconds")
+        await asyncio.sleep(2)
+
+
+async def main():
+    states = {}
+    with create_virtual_mouse() as ui:
+        print("Created virtual mouse: Moonlight Controller Virtual Mouse")
+        buttons = VirtualButtons(ui)
+        await asyncio.gather(
+            controller_manager(states, ui, buttons),
+            mouse_loop(states, ui, buttons),
+            sleep_monitor(states),
+        )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
