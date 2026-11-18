@@ -250,6 +250,11 @@ systemctl --user status moonlight-controller-keyboard.service
 systemctl --user status moonlight-home-button.service
 ```
 
+The Home button service sets `KDE_SESSION_VERSION=6` for `kdotool`, even
+if the user service manager starts before Plasma exports it. This lets the
+service find and activate existing Moonlight windows and pause desktop mouse
+emulation while Moonlight is open.
+
 Follow logs with:
 
 ```bash

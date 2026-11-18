@@ -6,6 +6,8 @@ After=moonlight-controller-keyboard.service
 
 [Service]
 Type=simple
+# kdotool needs this even if the user manager starts before Plasma exports it.
+Environment=KDE_SESSION_VERSION=6
 ExecStart=%h/.local/bin/moonlight-home-button
 Restart=always
 RestartSec=2
